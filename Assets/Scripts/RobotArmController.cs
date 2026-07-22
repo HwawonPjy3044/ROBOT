@@ -17,11 +17,15 @@ public class RobotArmController : MonoBehaviour
         RotateHome
     }
 
-    [Header("Joints")]
+    [Header("Joints (6 axes: base, shoulder, elbow, wrist pitch, wrist roll, gripper)")]
     public Transform baseJoint;
     public Transform shoulderJoint;
     public Transform elbowJoint;
+    public Transform wristPitchJoint;
+    public Transform wristRollJoint;
     public Transform gripperAttach;
+    public Transform leftFinger;
+    public Transform rightFinger;
 
     [Header("Targets")]
     public Transform pickupPoint;
@@ -29,11 +33,19 @@ public class RobotArmController : MonoBehaviour
 
     [Header("Arm geometry (must match the visual segment lengths)")]
     public float upperArmLength = 1.2f;
-    public float foreArmLength = 1.2f;
+    public float foreArmLength = 1.2f; // elbow to wrist pitch joint only
+    public float wristExtension = 0.3f; // wrist pitch joint to gripper attach (hangs straight down once wrist compensates)
 
     [Header("Retracted / transit pose (deg)")]
     public float safeShoulderAngle = 20f;
     public float safeElbowAngle = 30f;
+
+    [Header("Wrist roll (deg) - fixed for now, will map to a real servo later")]
+    public float wristRollAngle = 0f;
+
+    [Header("Gripper fingers - center offset from gripper axis (finger is 0.08 thick, so add half that to reach the box surface)")]
+    public float fingerOpenOffset = 0.29f;   // inner face right at the box's side - open gap = box width
+    public float fingerClosedOffset = 0.25f; // inner face presses flush against the box's side
 
     [Header("Grip offset - how far below the gripper (vacuum-style, top-face pick) the box hangs")]
     public float gripOffset = 0.35f;
@@ -60,12 +72,16 @@ public class RobotArmController : MonoBehaviour
 
         if (pickupPoint != null)
         {
-            ComputeIK(pickupPoint.position, out curBaseAngle, out _, out _);
+            ComputeIK(WristAdjustedTarget(pickupPoint.position), out curBaseAngle, out _, out _);
         }
 
         baseJoint.localEulerAngles = new Vector3(0, curBaseAngle, 0);
         shoulderJoint.localEulerAngles = new Vector3(curShoulderAngle, 0, 0);
         elbowJoint.localEulerAngles = new Vector3(curElbowAngle, 0, 0);
+        wristRollJoint.localEulerAngles = new Vector3(0, wristRollAngle, 0);
+        UpdateWristPitch();
+        SetFingers(true);
+
         Debug.Log("[Arm] Start - state=" + state);
     }
 
@@ -84,6 +100,7 @@ public class RobotArmController : MonoBehaviour
         }
         currentBox = box;
         state = State.LowerToPick;
+        SetFingers(true); // open, ready to grab
         Debug.Log("[Arm] Box accepted, -> LowerToPick");
     }
 
@@ -96,7 +113,7 @@ public class RobotArmController : MonoBehaviour
 
             case State.LowerToPick:
                 {
-                    ComputeIK(pickupPoint.position, out float b, out float s, out float e);
+                    ComputeIK(WristAdjustedTarget(pickupPoint.position), out float b, out float s, out float e);
                     bool baseDone = RotateBase(b);
                     bool armDone = RotateJoints(s, e);
                     if (baseDone && armDone)
@@ -116,7 +133,7 @@ public class RobotArmController : MonoBehaviour
 
             case State.RotateToPlace:
                 {
-                    ComputeIK(storageBin.GetNextPlacementPosition(), out float b, out _, out _);
+                    ComputeIK(WristAdjustedTarget(storageBin.GetNextPlacementPosition()), out float b, out _, out _);
                     if (RotateBase(b))
                         SetState(State.LowerToPlace);
                     break;
@@ -124,7 +141,7 @@ public class RobotArmController : MonoBehaviour
 
             case State.LowerToPlace:
                 {
-                    ComputeIK(storageBin.GetNextPlacementPosition(), out float b, out float s, out float e);
+                    ComputeIK(WristAdjustedTarget(storageBin.GetNextPlacementPosition()), out float b, out float s, out float e);
                     bool baseDone = RotateBase(b);
                     bool armDone = RotateJoints(s, e);
                     if (baseDone && armDone)
@@ -133,7 +150,7 @@ public class RobotArmController : MonoBehaviour
                 }
 
             case State.Releasing:
-                ReleaseBox();
+                ReleaseBox(); // opens the fingers, still down - mirrors "close, still down" during grab
                 SetState(State.LiftAfterPlace);
                 break;
 
@@ -144,12 +161,20 @@ public class RobotArmController : MonoBehaviour
 
             case State.RotateHome:
                 {
-                    ComputeIK(pickupPoint.position, out float b, out _, out _);
+                    ComputeIK(WristAdjustedTarget(pickupPoint.position), out float b, out _, out _);
                     if (RotateBase(b))
                         SetState(State.Idle);
                     break;
                 }
         }
+
+        UpdateWristPitch();
+
+        // Keep the carried box world-upright every frame (not just at the grab
+        // instant), so it stays correctly gripped between the fingers even while
+        // the base/shoulder/elbow keep moving during the carry.
+        if (currentBox != null)
+            currentBox.transform.rotation = Quaternion.identity;
     }
 
     void SetState(State next)
@@ -158,8 +183,14 @@ public class RobotArmController : MonoBehaviour
         state = next;
     }
 
+    // The wrist always compensates to point straight down, so the gripper hangs
+    // exactly `wristExtension` below the wrist pitch joint. The 2-link IK below
+    // solves for the wrist pitch joint's position, so it needs the target raised
+    // by that same amount.
+    Vector3 WristAdjustedTarget(Vector3 gripperTarget) => gripperTarget + Vector3.up * wristExtension;
+
     // Computes the base yaw, shoulder angle, and elbow angle needed so the
-    // gripper (end of a 2-segment planar arm) reaches worldTarget exactly.
+    // wrist pitch joint (end of the 2-segment planar arm) reaches worldTarget exactly.
     void ComputeIK(Vector3 worldTarget, out float baseAngle, out float shoulderAngle, out float elbowAngle)
     {
         Vector3 origin = baseJoint.position;
@@ -208,9 +239,46 @@ public class RobotArmController : MonoBehaviour
         return AngleReached(curShoulderAngle, shoulderTarget) && AngleReached(curElbowAngle, elbowTarget);
     }
 
+    // Keeps the gripper facing straight down regardless of how the shoulder/elbow
+    // are currently bent - mirrors how a real arm's wrist compensates.
+    void UpdateWristPitch()
+    {
+        float wristPitch = 180f - curShoulderAngle - curElbowAngle;
+        wristPitchJoint.localEulerAngles = new Vector3(wristPitch, 0, 0);
+    }
+
+    // Fingers are a fixed-length claw permanently attached to the wrist (like the
+    // real gripper - it doesn't slide up and down, only its two halves open/close).
+    // A positive local Y here reliably points "down toward the box" in world space,
+    // because the wrist always holds a net 180-degree pitch (see UpdateWristPitch),
+    // and staying in local space keeps the fingers rigidly attached to the wrist
+    // instead of floating off to a fixed world-space spot.
+    void SetFingers(bool open)
+    {
+        float offset = open ? fingerOpenOffset : fingerClosedOffset;
+
+        if (leftFinger == null || rightFinger == null)
+        {
+            Debug.LogError("[Arm] SetFingers - leftFinger or rightFinger reference is NULL! open=" + open);
+            return;
+        }
+
+        leftFinger.localPosition = new Vector3(-offset, gripOffset, 0f);
+        rightFinger.localPosition = new Vector3(offset, gripOffset, 0f);
+        leftFinger.localRotation = Quaternion.identity;
+        rightFinger.localRotation = Quaternion.identity;
+    }
+
     void AttachBox()
     {
         if (currentBox == null) return;
+
+        float gap = Vector3.Distance(gripperAttach.position, pickupPoint.position);
+        Debug.Log("[Arm] AttachBox - pickupPoint=" + pickupPoint.position +
+                   " gripperAttach=" + gripperAttach.position +
+                   " wristPitchJoint=" + wristPitchJoint.position +
+                   " gap=" + gap);
+
         BoxMover mover = currentBox.GetComponent<BoxMover>();
         if (mover != null) mover.enabled = false;
         currentBox.transform.SetParent(gripperAttach);
@@ -220,6 +288,8 @@ public class RobotArmController : MonoBehaviour
         // top face - not a side - is what stays against the gripper.
         currentBox.transform.position = gripperAttach.position + Vector3.down * gripOffset;
         currentBox.transform.rotation = Quaternion.identity;
+
+        SetFingers(false); // close around the box
     }
 
     void ReleaseBox()
@@ -230,5 +300,7 @@ public class RobotArmController : MonoBehaviour
         currentBox.transform.rotation = Quaternion.identity;
         storageBin.ConfirmPlaced(currentBox);
         currentBox = null;
+
+        SetFingers(true); // open, release the box
     }
 }
